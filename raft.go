@@ -408,12 +408,11 @@ func (cm *ConsensusModule) startElection() {
 // (or -1 if there's no log) for this server.
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
-	if len(cm.log) < 0 {
-		return -1, -1
+	if len(cm.log) > 0 {
+		lastLogIndex := len(cm.log) - 1
+		return lastLogIndex, cm.log[lastLogIndex].Term
 	}
-
-	lastLogIndex := len(cm.log) - 1
-	return lastLogIndex, cm.log[lastLogIndex].Term
+	return -1, -1
 }
 
 // becomeFollower makes cm a follower and resets its state.
