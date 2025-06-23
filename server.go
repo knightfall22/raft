@@ -139,6 +139,7 @@ func (s *Server) DisconnectPeer(peerId int) error {
 	if s.peerClients[peerId] != nil {
 		err := s.peerClients[peerId].Close()
 		s.peerClients[peerId] = nil
+		log.Printf("[%d] Peer disconnected", peerId)
 		return err
 	}
 
