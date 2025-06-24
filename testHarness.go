@@ -2,6 +2,7 @@ package raft
 
 import (
 	"log"
+	"sync"
 	"testing"
 	"time"
 )
@@ -11,6 +12,8 @@ func init() {
 }
 
 type Harness struct {
+	mu sync.Mutex
+
 	// cluster is a list of all the raft servers participating in a cluster.
 	cluster []*Server
 
@@ -19,6 +22,14 @@ type Harness struct {
 	// will pass to or from it).
 	connected []bool
 
+	// commitChans contains a comit channel per server in cluster
+	commitChans []chan CommitEntry
+
+	// commits at index i holds the sequence of commits made by server i so far.
+	// It is populated by goroutines that listen on the corresponding commitChans
+	// channel.
+	commits [][]CommitEntry
+
 	n int
 	t *testing.T
 }
@@ -26,6 +37,8 @@ type Harness struct {
 // Creates a new test harness, initializes n server connected to each other
 func NewHarness(t *testing.T, n int) *Harness {
 	ns := make([]*Server, n)
+	commitChans := make([]chan CommitEntry, n)
+	commits := make([][]CommitEntry, n)
 	connected := make([]bool, n)
 	ready := make(chan any)
 
@@ -39,7 +52,8 @@ func NewHarness(t *testing.T, n int) *Harness {
 			}
 		}
 
-		ns[id] = NewServer(id, peerIds, ready)
+		commitChans[id] = make(chan CommitEntry)
+		ns[id] = NewServer(id, peerIds, ready, commitChans[id])
 		ns[id].Serve()
 	}
 
@@ -54,12 +68,20 @@ func NewHarness(t *testing.T, n int) *Harness {
 
 	close(ready)
 
-	return &Harness{
-		cluster:   ns,
-		t:         t,
-		connected: connected,
-		n:         n,
+	h := &Harness{
+		cluster:     ns,
+		t:           t,
+		commitChans: commitChans,
+		commits:     commits,
+		connected:   connected,
+		n:           n,
 	}
+
+	for id := range n {
+		go h.collectCommits(id)
+	}
+
+	return h
 }
 
 // Shutdown shuts down all the servers in the harness and waits for them to
@@ -151,6 +173,119 @@ func (h *Harness) CheckNoLeader() {
 				h.t.Fatalf("server %d leader; want none", id)
 			}
 		}
+	}
+}
+
+// CheckCommitted verifies that all connected servers have cmd committed with
+// the same index. It also verifies that all commands *before* cmd in
+// the commit sequence match. For this to work properly, all commands submitted
+// to Raft should be unique positive ints.
+// Returns the number of servers that have this command committed, and its
+// log index.
+func (h *Harness) CheckCommitted(cmd int) (nc, index int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Find the length of the commits slice for connected servers.
+	commitLen := -1
+
+	for id := range h.commits {
+		if h.connected[id] {
+			if commitLen >= 0 {
+				// If this was set already, expect the new length to be the same.
+				if len(h.commits[id]) != commitLen {
+					h.t.Fatalf("commits[%d] = %d, commitsLen = %d", id, h.commits[id], commitLen)
+				}
+			} else {
+				commitLen = len(h.commits[id])
+			}
+		}
+	}
+
+	// Check consistency of commits from the start and to the command we're asked
+	// about. This loop will return once a command=cmd is found.
+	for c := range commitLen {
+		cmdAtC := -1
+
+		for id := range h.commits {
+			if h.connected[id] {
+				cmdOfN := h.commits[id][c].Command.(int)
+				if cmdAtC >= 0 {
+					if cmdAtC != cmdOfN {
+						h.t.Errorf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtC, id, c)
+					}
+				} else {
+					cmdAtC = cmdOfN
+				}
+			}
+		}
+
+		if cmdAtC == cmd {
+			index := -1
+
+			for id := range h.commits {
+				if h.connected[id] {
+					if index >= 0 && h.commits[id][c].Index != index {
+						h.t.Errorf("got Index=%d, want %d at h.commits[%d][%d]", h.commits[id][c].Index, index, id, c)
+					} else {
+						index = h.commits[id][c].Index
+					}
+					nc++
+				}
+			}
+
+			return nc, index
+		}
+	}
+
+	// If there's no early return, we haven't found the command we were looking
+	// for.
+	h.t.Errorf("cmd=%d not found in commits", cmd)
+	return -1, -1
+}
+
+// CheckCommittedN verifies that cmd was committed by exactly n connected
+// servers.
+func (h *Harness) CheckCommittedN(cmd int, n int) {
+	nc, _ := h.CheckCommitted(cmd)
+	if nc != n {
+		h.t.Errorf("CheckCommittedN got nc=%d, want %d", nc, n)
+	}
+}
+
+// CheckNotCommitted verifies that no command equal to cmd has been committed
+// by any of the active servers yet.
+func (h *Harness) CheckNotCommitted(cmd int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for id := range h.n {
+		if h.connected[id] {
+			for c := range len(h.commits[id]) {
+				gotCmd := h.commits[id][c].Command.(int)
+
+				if gotCmd == cmd {
+					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, id, c)
+				}
+			}
+		}
+	}
+}
+
+// SubmitToServer submits the command to serverId.
+func (h *Harness) SubmitToServer(serverId int, cmd any) bool {
+	return h.cluster[serverId].cm.Submit(cmd)
+}
+
+// collectCommits reads channel commitChans[i] and adds all received entries
+// to the corresponding commits[i]. It's blocking and should be run in a
+// separate goroutine. It returns when commitChans[i] is closed.
+func (h *Harness) collectCommits(id int) {
+	for c := range h.commitChans[id] {
+		h.mu.Lock()
+		tlog("collectCommits(%d) got %+v", id, c)
+		h.commits[id] = append(h.commits[id], c)
+		h.mu.Unlock()
 	}
 }
 

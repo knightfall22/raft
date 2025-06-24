@@ -98,7 +98,7 @@ type ConsensusModule struct {
 
 // Create a new CM with an id, list of peerIds, and server.
 // Uses a ready channel to signal that all peers are connected and it's safe to start the state machine
-func NewConsensusModule(id int, peerIds []int, server *Server, ready chan any) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, ready chan any, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
@@ -109,6 +109,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready chan any) *
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 
 	go func() {
@@ -155,7 +156,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 
 	if cm.currentTerm == args.Term &&
 		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
-		(args.LastLogIndex >= lastLogIndex && lastLogTerm == args.LastLogTerm) {
+		(args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateId
@@ -213,7 +215,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 
 		// Does our log contain an entry at PrevLogIndex whose term matches
 		// PrevLogTerm?
-		if args.PrevLogIndex == -1 && (args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+		if args.PrevLogIndex == -1 || (args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
 			reply.Success = true
 
 			// Find an insertion point - where there's a term mismatch between
@@ -274,6 +276,8 @@ func (cm *ConsensusModule) Stop() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.state = Dead
+	close(cm.commitChan)
+	close(cm.newCommitReadyChan)
 	cm.dlog("become dead")
 }
 
@@ -543,7 +547,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
 
-			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, reply); err == nil {
+			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 
@@ -567,7 +571,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 							if cm.log[i].Term == cm.currentTerm { //Matches with leader
 								matchCount := 1
 
-								//If Peers match index is greater than our current commit index
+								//If Peers match index is >= our current commit index
 								//Increment matchCount. If matchCounts matches with a majority update commit index
 								for _, peerId := range cm.peerIds {
 									if cm.matchIndex[peerId] >= i {
