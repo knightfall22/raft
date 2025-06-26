@@ -30,6 +30,14 @@ type Harness struct {
 	// channel.
 	commits [][]CommitEntry
 
+	// alive has a bool per server in cluster, specifying whether this server is
+	// currently alive (false means it has crashed and wasn't restarted yet).
+	// connected implies alive.
+	alive []bool
+
+	// Used to persit state information
+	storage []*MapStorage
+
 	n int
 	t *testing.T
 }
@@ -40,7 +48,9 @@ func NewHarness(t *testing.T, n int) *Harness {
 	commitChans := make([]chan CommitEntry, n)
 	commits := make([][]CommitEntry, n)
 	connected := make([]bool, n)
+	alive := make([]bool, n)
 	ready := make(chan any)
+	storage := make([]*MapStorage, n)
 
 	// Create all Servers in this cluster, assign ids and peer ids.
 	for id := range n {
@@ -52,8 +62,9 @@ func NewHarness(t *testing.T, n int) *Harness {
 			}
 		}
 
+		storage[id] = NewMapStorage()
 		commitChans[id] = make(chan CommitEntry)
-		ns[id] = NewServer(id, peerIds, ready, commitChans[id])
+		ns[id] = NewServer(id, peerIds, ready, storage[id], commitChans[id])
 		ns[id].Serve()
 	}
 
@@ -63,6 +74,8 @@ func NewHarness(t *testing.T, n int) *Harness {
 				ns[id].ConnectToPeer(p, ns[p].GetListenAddr())
 			}
 		}
+
+		alive[id] = true
 		connected[id] = true
 	}
 
@@ -71,6 +84,8 @@ func NewHarness(t *testing.T, n int) *Harness {
 	h := &Harness{
 		cluster:     ns,
 		t:           t,
+		alive:       alive,
+		storage:     storage,
 		commitChans: commitChans,
 		commits:     commits,
 		connected:   connected,
@@ -93,7 +108,14 @@ func (h *Harness) Shutdown() {
 	}
 
 	for id := range h.n {
-		h.cluster[id].Shutdown()
+		if h.alive[id] {
+			h.alive[id] = false
+			h.cluster[id].Shutdown()
+		}
+	}
+
+	for id := range h.n {
+		close(h.commitChans[id])
 	}
 }
 
@@ -114,7 +136,7 @@ func (h *Harness) DisconnectPeer(id int) {
 func (h *Harness) ReconnectPeer(id int) {
 	tlog("Reconnect %d", id)
 	for p := range h.cluster {
-		if p != id {
+		if p != id && h.alive[p] {
 			//Connect sever at `id` to a peer `p`
 			if err := h.cluster[id].ConnectToPeer(p, h.cluster[p].GetListenAddr()); err != nil {
 				h.t.Fatal(err)
@@ -126,7 +148,65 @@ func (h *Harness) ReconnectPeer(id int) {
 			}
 		}
 	}
+
 	h.connected[id] = true
+	h.alive[id] = true
+}
+
+// CrashPeer "crashes" a server by disconnecting it from all peers and then
+// asking it to shut down. We're not going to use the same server instance
+// again, but its storage is retained.
+func (h *Harness) CrashPeer(id int) {
+	tlog("Crash %d", id)
+	h.DisconnectPeer(id)
+	h.alive[id] = false
+	h.cluster[id].Shutdown()
+
+	// Clear out the commits slice for the crashed server; Raft assumes the client
+	// has no persistent state. Once this server comes back online it will replay
+	// the whole log to us.
+	h.mu.Lock()
+	h.commits[id] = h.commits[id][:0]
+	h.mu.Unlock()
+}
+
+// RestartPeer "restarts" a server by creating a new Server instance and giving
+// it the appropriate storage, reconnecting it to peers.
+func (h *Harness) RestartPeer(id int) {
+	if h.alive[id] {
+		h.t.Fatalf("id=%d is alive in RestartPeer", id)
+	}
+	tlog("Restart %d", id)
+
+	peerIds := make([]int, 0)
+	for p := range h.n {
+		if p != id {
+			peerIds = append(peerIds, p)
+		}
+	}
+
+	ready := make(chan any)
+	h.cluster[id] = NewServer(id, peerIds, ready, h.storage[id], h.commitChans[id])
+	h.cluster[id].Serve()
+	h.ReconnectPeer(id)
+	close(ready)
+	h.alive[id] = true
+	sleepMs(20)
+
+	tlog("[%d] Here are my commits %v", id, h.cluster[id].cm.log)
+}
+
+// PeerDropCallsAfterN instructs peer `id` to drop calls after the next `n`
+// are made.
+func (h *Harness) PeerDropCallsAfterN(id int, n int) {
+	tlog("peer %d drop calls after %d", id, n)
+	h.cluster[id].Proxy().DropCallsAfterN(n)
+}
+
+// PeerDontDropCalls instructs peer `id` to stop dropping calls.
+func (h *Harness) PeerDontDropCalls(id int) {
+	tlog("peer %d don't drop calls", id)
+	h.cluster[id].Proxy().DontDropCalls()
 }
 
 // CheckSingleLeader checks that only a single server thinks it's the leader.
@@ -273,7 +353,7 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 }
 
 // SubmitToServer submits the command to serverId.
-func (h *Harness) SubmitToServer(serverId int, cmd any) bool {
+func (h *Harness) SubmitToServer(serverId int, cmd any) int {
 	return h.cluster[serverId].cm.Submit(cmd)
 }
 
