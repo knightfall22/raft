@@ -80,6 +80,7 @@ func (s *Server) Serve() {
 			if err != nil {
 				select {
 				case <-s.quit:
+					log.Printf("closing server connection")
 					return
 				default:
 					log.Fatal("accept error:", err)
@@ -87,11 +88,15 @@ func (s *Server) Serve() {
 			}
 			s.wg.Add(1)
 			go func() {
+				defer s.wg.Done()
 				s.rpcServer.ServeConn(conn)
-				s.wg.Done()
 			}()
 		}
 	}()
+}
+
+func (s *Server) Submit(cmd any) int {
+	return s.cm.Submit(cmd)
 }
 
 // DisconnectAll closes all the client connections to peers for this server.

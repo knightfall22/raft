@@ -186,8 +186,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = false
 	}
 
-	cm.persistToStorage()
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlog("... RequestVote reply: %+v", reply)
 
 	return nil
@@ -241,6 +241,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		// Does our log contain an entry at PrevLogIndex whose term matches
 		// PrevLogTerm?
 		if args.PrevLogIndex == -1 || (args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			cm.dlog("... log matches up to previous index and term in AppendEntries; Entries=%v", args.Entries)
 			reply.Success = true
 
 			// Find an insertion point - where there's a term mismatch between
@@ -303,8 +304,8 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		}
 	}
 
-	cm.persistToStorage()
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlog("AppendEntries reply: %+v", *reply)
 	return nil
 }
@@ -320,8 +321,11 @@ func (cm *ConsensusModule) Report() (int, int, bool) {
 // it may take a bit of time (up to ~election timeout) for all goroutines to
 // exit.
 func (cm *ConsensusModule) Stop() {
-	cm.dlog("CM.Stop called")
 	cm.mu.Lock()
+	if cm.state == Leader {
+		cm.dlog("nextIndex: %+v and matchIndex: %+v", cm.nextIndex, cm.matchIndex)
+	}
+	cm.dlog("CM.Stop called")
 	cm.state = Dead
 	cm.mu.Unlock()
 	cm.dlog("becomes Dead")
@@ -508,7 +512,7 @@ func (cm *ConsensusModule) startLeader() {
 	go func(heartbeat time.Duration) {
 		cm.leaderSendHeartbeats()
 
-		t := time.NewTimer(50 * time.Millisecond)
+		t := time.NewTimer(heartbeat)
 		defer t.Stop()
 
 		// Send periodic heartbeats, as long as still leader.
@@ -522,6 +526,7 @@ func (cm *ConsensusModule) startLeader() {
 				// Reset timer to fire again after heartbeatTimeout.
 				t.Reset(heartbeat)
 			case _, ok := <-cm.triggerAEChan:
+				cm.dlog("Submission has occured")
 				if ok {
 
 					doSend = true
@@ -584,6 +589,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Unlock()
 
 	for _, peerId := range cm.peerIds {
+
 		go func() {
 			cm.mu.Lock()
 			ni := cm.nextIndex[peerId]
@@ -610,16 +616,18 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				defer cm.mu.Unlock()
 
-				if reply.Term > savedCurrentTerm {
+				if reply.Term > cm.currentTerm {
 					cm.dlog("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
+					cm.mu.Unlock()
 					return
 				}
 
 				if cm.state == Leader && savedCurrentTerm == reply.Term {
 					if reply.Success {
+						cm.dlog("About to set nextIndex for %d with entries: %+v and entry length: %d", peerId, entries, len(entries))
+						cm.dlog("Current entries: %+v", ni)
 						cm.nextIndex[peerId] = ni + len(entries)
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
 
@@ -646,10 +654,15 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 							}
 						}
 
+						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d", peerId, cm.nextIndex, cm.matchIndex, cm.commitIndex)
 						if cm.commitIndex != savedCommitedIndex {
 							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
+							cm.mu.Unlock()
 							cm.newCommitReadyChan <- struct{}{}
 							cm.triggerAEChan <- struct{}{}
+
+						} else {
+							cm.mu.Unlock()
 						}
 					} else {
 						if reply.ConflictTerm >= 0 {
@@ -671,8 +684,11 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 							cm.nextIndex[peerId] = reply.ConflictIndex
 						}
 						cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+						cm.mu.Unlock()
 
 					}
+				} else {
+					cm.mu.Unlock()
 				}
 			}
 		}()
@@ -710,7 +726,6 @@ func (cm *ConsensusModule) commitChanSender() {
 			}
 		}
 
-		cm.persistToStorage()
 	}
 
 	cm.dlog("commitChanSender done")

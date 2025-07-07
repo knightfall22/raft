@@ -8,7 +8,7 @@ import (
 )
 
 func TestElectionBasic(t *testing.T) {
-	h := NewHarness(t, 3)
+	h := NewHarness(t, 5)
 	defer h.Shutdown()
 
 	h.CheckSingleLeader(5)
@@ -188,6 +188,31 @@ func TestCommitOneCommand(t *testing.T) {
 	sleepMs(150)
 
 	h.CheckCommittedN(42, 3)
+}
+
+func TestCommitMultipleCommand(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*time.Millisecond)()
+
+	h := NewHarness(t, 5)
+	defer h.Shutdown()
+
+	leader, _ := h.CheckSingleLeader(3)
+	for n := range 20 {
+		go func() {
+
+			tlog("submitting %d to %d", n, leader)
+			isLeader := h.SubmitToServer(leader, n)
+
+			if isLeader == -1 {
+				t.Errorf("want id=%d leader, but it's not", leader)
+			}
+		}()
+	}
+
+	sleepMs(150)
+
+	h.CheckCommittedN(4, 3)
+	sleepMs(150)
 }
 
 func TestCommitAfterCallDrops(t *testing.T) {
